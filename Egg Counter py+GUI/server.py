@@ -1,9 +1,13 @@
-﻿import cv2
+﻿import os
+# Force FFmpeg to use TCP for RTSP streams before initializing OpenCV
+# THIS MUST REMAIN AT THE VERY TOP
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+
+import cv2
 import asyncio
 import websockets
 import json
 import datetime
-import os
 import time
 import numpy as np
 import copy
@@ -16,7 +20,11 @@ app = Flask(__name__)
 CORS(app)
 
 # --- CONFIGURATION ---
-CAM_IDS = [0, 1, 2]  
+CAM_STREAMS = {
+    0: "rtsp://admin:JNJbuilt1%21@192.168.100.200:554/Streaming/Channels/102"
+}
+
+CAM_IDS = list(CAM_STREAMS.keys())
 DB_FILE = 'egg_data.json'
 
 try:
@@ -44,12 +52,10 @@ def load_initial_db():
             except: return {}
     return {}
 
-# Load hard drive data into RAM at startup
 ram_db = load_initial_db()
 
 # --- THE BACKGROUND DISK SAVER ---
 def disk_saver_worker():
-    """Silently saves RAM data to the hard drive every 3 seconds so cameras never lag."""
     while True:
         time.sleep(3)
         with ram_db_lock:
@@ -59,6 +65,42 @@ def disk_saver_worker():
                 json.dump(db_copy, f, indent=4)
         except Exception as e:
             print(f"Background save error: {e}")
+
+# --- FAST RTSP THREAD CLASS ---
+# This continuously drains the network buffer so OpenCV never drops packets
+class FastRTSP:
+    def __init__(self, url):
+        self.stream = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+        self.stream.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.grabbed, self.frame = self.stream.read()
+        self.stopped = False
+        self.lock = Lock()
+        
+        # Start reading frames in a separate background thread immediately
+        Thread(target=self.update, daemon=True).start()
+
+    def update(self):
+        while not self.stopped:
+            if not self.stream.isOpened():
+                time.sleep(0.1)
+                continue
+            
+            # Continuously pull data so packets never drop
+            grabbed, frame = self.stream.read()
+            with self.lock:
+                self.grabbed = grabbed
+                self.frame = frame
+
+    def read(self):
+        with self.lock:
+            # Return a copy to prevent YOLO from altering the thread's raw frame memory
+            if self.frame is not None:
+                return self.grabbed, self.frame.copy()
+            return self.grabbed, None
+
+    def stop(self):
+        self.stopped = True
+        self.stream.release()
 
 # --- HARDWARE INITIALIZATION ---
 cameras = {}
@@ -74,30 +116,40 @@ def create_offline_frame(cam_id):
     return frame
 
 for idx in CAM_IDS:
-    cap = cv2.VideoCapture(idx)
-    if cap.isOpened():
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cameras[idx] = cap
+    rtsp_url = CAM_STREAMS[idx]
+    print(f"Starting Fast Thread for CAM {idx} RTSP stream...")
+    
+    # Initialize our new threaded reader
+    cam_stream = FastRTSP(rtsp_url)
+    
+    # Brief pause to let the thread grab the first frame
+    time.sleep(1.0) 
+    
+    if cam_stream.grabbed:
+        cameras[idx] = cam_stream
         print(f"SUCCESS: Camera {idx} connected.")
     else:
-        print(f"WARNING: Camera {idx} not detected.")
+        print(f"WARNING: Camera {idx} stream could not be opened.")
         cameras[idx] = None
         latest_frames[idx] = create_offline_frame(idx)
 
 # --- PROCESSING LOGIC ---
 def inference_worker(cam_id):
-    cap = cameras[cam_id]
-    if cap is None: return 
+    stream = cameras[cam_id]
+    if stream is None: return 
     
     model = models[cam_id]
     line_y = 240 
     
-    while cap.isOpened():
-        success, frame = cap.read()
-        if not success: 
-            time.sleep(0.1)
+    while True:
+        success, frame = stream.read()
+        
+        if not success or frame is None: 
+            time.sleep(0.01) # Prevent CPU maxing if stream briefly stutters
             continue
+
+        # Resize the stream down to 640x480 to maintain high FPS for your model
+        frame = cv2.resize(frame, (640, 480))
 
         roi = frame[line_y:480, 0:640]
         results = model.track(roi, persist=True, conf=0.75, verbose=False, tracker="bytetrack.yaml")
@@ -121,7 +173,6 @@ def inference_worker(cam_id):
                 today = datetime.datetime.now().strftime('%Y-%m-%d')
                 key = f"cam_{cam_id}"
                 
-                # --- FAST RAM SAVING (No Hard Drive I/O) ---
                 with ram_db_lock:
                     if today not in ram_db:
                         ram_db[today] = {f"cam_{i}": 0 for i in CAM_IDS}
@@ -129,7 +180,6 @@ def inference_worker(cam_id):
                     ram_db[today][key] = ram_db[today].get(key, 0) + new_eggs_this_frame
                     current_totals = ram_db[today].copy()
                 
-                # Broadcast instantly to the Expo App
                 if main_loop:
                     asyncio.run_coroutine_threadsafe(broadcast_update(current_totals), main_loop)
 
@@ -172,7 +222,6 @@ def reset_counter(cam_id):
         ram_db[today][key] = 0
         current_totals = ram_db[today].copy()
         
-        # Instantly write to disk on reset for safety
         with open(DB_FILE, 'w') as f:
             json.dump(ram_db, f, indent=4)
 
@@ -195,7 +244,6 @@ async def main():
     global main_loop
     main_loop = asyncio.get_running_loop()
     
-    # Start the background disk saver
     Thread(target=disk_saver_worker, daemon=True).start()
     
     for i in CAM_IDS: 
@@ -212,4 +260,8 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n[!] Ctrl+C detected. Executing hard shutdown...")
+        # Cleanly stop the threads if possible
+        for i in CAM_IDS:
+            if cameras[i] is not None:
+                cameras[i].stop()
         os._exit(0)
